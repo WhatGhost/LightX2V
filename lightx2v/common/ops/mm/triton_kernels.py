@@ -2,6 +2,8 @@ import torch
 from triton import Config, autotune, cdiv, heuristics, jit, next_power_of_2
 from triton import language as tl
 
+from lightx2v_platform.ops.mm import get_fp8_gemm_triton_configs
+
 _ordered_datatypes = [torch.int8, torch.float16, torch.bfloat16, torch.float32]
 
 
@@ -520,7 +522,7 @@ def fp8_gemm_bias_kernel(
 
     rk = pid_z * BLOCK_K + tl.arange(0, BLOCK_K)
 
-    A_ptr = A + (ram[:, None] * stride_am + rk[None, :] * stride_ak)
+    A_ptr = A + (ram[:, None].to(tl.int64) * stride_am + rk[None, :] * stride_ak)
     B_ptr = B + (rk[:, None] * stride_bk + rbn[None, :] * stride_bn)
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
@@ -541,11 +543,11 @@ def fp8_gemm_bias_kernel(
 
     a_scales_ptr = A_SCALES + pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     b_scales_ptr = B_SCALES + pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    a_scales = tl.load(a_scales_ptr).to(tl.float32)  # [BM]
-    b_scales = tl.load(b_scales_ptr).to(tl.float32)  # [BN]
+    a_scales = tl.load(a_scales_ptr, mask=rm < M, other=0.0).to(tl.float32)  # [BM]
+    b_scales = tl.load(b_scales_ptr, mask=rn < N, other=0.0).to(tl.float32)  # [BN]
 
     bias_ptr = BIAS + pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    bias = tl.load(bias_ptr).to(tl.float32)  # [BN]
+    bias = tl.load(bias_ptr, mask=rn < N, other=0.0).to(tl.float32)  # [BN]
 
     out = (acc * a_scales[:, None]) * b_scales[None, :] + bias[None, :]
     if fuse_gelu:
@@ -555,7 +557,7 @@ def fp8_gemm_bias_kernel(
 
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    C_ptr = C + (rm[:, None] * stride_cm + rn[None, :] * stride_cn)
+    C_ptr = C + (rm[:, None].to(tl.int64) * stride_cm + rn[None, :] * stride_cn)
     mask = (rm < M)[:, None] & (rn < N)[None, :]
 
     if SPLIT_K == 1:
@@ -566,6 +568,7 @@ def fp8_gemm_bias_kernel(
 
 def fp8_gemm_bias_triton(a, b, bias, a_scales, b_scales, fuse_gelu=False, output_dtype=None):
     assert a.is_cuda and b.is_cuda, "This kernel is for CUDA"
+    _prepare_fp8_gemm_configs(a.device)
     assert a.dtype in (getattr(torch, "float8_e4m3fn", None), getattr(torch, "float8_e4m3fnuz", None)), f"a.dtype={a.dtype} is not FP8 E4M3"
     assert b.dtype in (getattr(torch, "float8_e4m3fn", None), getattr(torch, "float8_e4m3fnuz", None)), f"b.dtype={b.dtype} is not FP8 E4M3"
 
@@ -666,7 +669,7 @@ def fp8_gemm_kernel(
 
     rk = pid_z * BLOCK_K + tl.arange(0, BLOCK_K)
 
-    A_ptr = A + (ram[:, None] * stride_am + rk[None, :] * stride_ak)
+    A_ptr = A + (ram[:, None].to(tl.int64) * stride_am + rk[None, :] * stride_ak)
     B_ptr = B + (rk[:, None] * stride_bk + rbn[None, :] * stride_bn)
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
@@ -687,8 +690,8 @@ def fp8_gemm_kernel(
 
     a_scales_ptr = A_SCALES + pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     b_scales_ptr = B_SCALES + pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    a_scales = tl.load(a_scales_ptr).to(tl.float32)  # [BM]
-    b_scales = tl.load(b_scales_ptr).to(tl.float32)  # [BN]
+    a_scales = tl.load(a_scales_ptr, mask=rm < M, other=0.0).to(tl.float32)  # [BM]
+    b_scales = tl.load(b_scales_ptr, mask=rn < N, other=0.0).to(tl.float32)  # [BN]
 
     out = (acc * a_scales[:, None]) * b_scales[None, :]
     if fuse_gelu:
@@ -698,7 +701,7 @@ def fp8_gemm_kernel(
 
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    C_ptr = C + (rm[:, None] * stride_cm + rn[None, :] * stride_cn)
+    C_ptr = C + (rm[:, None].to(tl.int64) * stride_cm + rn[None, :] * stride_cn)
     mask = (rm < M)[:, None] & (rn < N)[None, :]
 
     if SPLIT_K == 1:
@@ -707,8 +710,23 @@ def fp8_gemm_kernel(
         tl.atomic_add(C_ptr, out, mask=mask)
 
 
+_fp8_gemm_configs_ready = False
+
+
+def _prepare_fp8_gemm_configs(device):
+    global _fp8_gemm_configs_ready
+    if _fp8_gemm_configs_ready:
+        return
+    _fp8_gemm_configs_ready = True
+    configs = get_fp8_gemm_triton_configs(device)
+    if configs:
+        fp8_gemm_kernel.configs = configs
+        fp8_gemm_bias_kernel.configs = configs
+
+
 def fp8_gemm_triton(a, b, a_scales, b_scales, fuse_gelu=False, output_dtype=None):
     assert a.is_cuda and b.is_cuda
+    _prepare_fp8_gemm_configs(a.device)
     e4m3_ok = []
     if hasattr(torch, "float8_e4m3fn"):
         e4m3_ok.append(torch.float8_e4m3fn)

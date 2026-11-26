@@ -5,6 +5,7 @@ AMD ROCm provides CUDA-compatible APIs through HIP (Heterogeneous-computing Inte
 This module handles AMD-specific optimizations including:
 - Disabling cudnn for faster VAE convolution
 - sgl_kernel compatibility layer using aiter library (optional; only for the aiter-backed GEMM/RMSNorm path)
+- A single fp8-triton GEMM config on RDNA4 (gfx1200/gfx1201)
 """
 
 import sys
@@ -136,6 +137,21 @@ class AmdRocmDevice:
                 if mod is not None and hasattr(mod, "sgl_kernel"):
                     setattr(mod, "sgl_kernel", sgl_kernel)
             logger.info("  - aiter sgl_kernel compatibility layer enabled (RMSNorm, GEMM)")
+
+    @staticmethod
+    def fp8_gemm_triton_configs(device):
+        """Launch configs for the fp8-triton GEMM kernels on ``device``, or None to keep their autotuning.
+
+        RDNA4 (gfx1200/gfx1201) has 64 KB of LDS: only one of the default candidates fits, yet autotuning still
+        benchmarks the list on every new M (extra time and GiBs of memory on the first request at each sequence
+        length). This is the fastest candidate that fits, measured on gfx1201 over the MiniMax-H3 DiT shapes; a single
+        config skips autotuning.
+        """
+        if torch.cuda.get_device_properties(device).gcnArchName.split(":")[0] not in ("gfx1200", "gfx1201"):
+            return None
+        from triton import Config
+
+        return [Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64, "SPLIT_K": 1}, num_stages=2, num_warps=8)]
 
     @staticmethod
     def is_available() -> bool:
