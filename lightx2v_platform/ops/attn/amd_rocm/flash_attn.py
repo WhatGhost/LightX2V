@@ -86,6 +86,13 @@ class AiterAttnWeight(AttnWeightTemplate):
             bs = 1
         elif len(q.shape) == 4:
             bs = q.shape[0]
+            # Without cu_seqlens a 4D [B, S, H, D] input is a dense batch of equal-length sequences.
+            if cu_seqlens_q is None:
+                cu_seqlens_q = torch.arange(0, (bs + 1) * q.shape[1], q.shape[1], dtype=torch.int32, device=q.device)
+                max_seqlen_q = q.shape[1]
+            if cu_seqlens_kv is None:
+                cu_seqlens_kv = torch.arange(0, (bs + 1) * k.shape[1], k.shape[1], dtype=torch.int32, device=k.device)
+                max_seqlen_kv = k.shape[1]
             q = q.reshape(-1, q.shape[-2], q.shape[-1])
             k = k.reshape(-1, k.shape[-2], k.shape[-1])
             v = v.reshape(-1, v.shape[-2], v.shape[-1])
