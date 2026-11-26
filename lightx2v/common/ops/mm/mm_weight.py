@@ -251,15 +251,21 @@ class MMWeightTemplate(CoreOpStatistics, metaclass=ABCMeta):
                 return self.bias
             return (self.bias + self.bias_diff).to(self.bias.dtype)
 
+    def _scaled_lora_down(self, input_tensor):
+        h = torch.mm(input_tensor.to(self.lora_down.dtype), self.lora_down.t())
+        return (h * (self.lora_strength * self.lora_scale)).to(h.dtype)
+
     def apply_lora(self, input_tensor):
         with torch.autocast(device_type=input_tensor.device.type, enabled=False):
-            h = torch.mm(input_tensor.to(self.lora_down.dtype), self.lora_down.t())
-            out = torch.mm(h, self.lora_up.t())
-            return self.lora_strength * self.lora_scale * out
+            return torch.mm(self._scaled_lora_down(input_tensor), self.lora_up.t())
 
     def add_lora(self, output, input_tensor):
         # Keep the base GEMM output contract, including for quantized kernels.
-        return (output + self.apply_lora(input_tensor)).to(output.dtype)
+        if input_tensor.dim() != 2 or output.dim() != 2 or output.stride(-1) != 1 or output.dtype != self.lora_up.dtype:
+            return (output + self.apply_lora(input_tensor)).to(output.dtype)
+        # Callers pass a fresh GEMM result, so the up projection can accumulate into it.
+        with torch.autocast(device_type=input_tensor.device.type, enabled=False):
+            return output.addmm_(self._scaled_lora_down(input_tensor), self.lora_up.t())
 
     def _get_lora_target_device(self):
         if hasattr(self, "weight") and self.weight is not None:
