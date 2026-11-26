@@ -59,14 +59,13 @@ def fp8_quantize_kernel(X, OUT, SCALES, HDIM, BLOCK_SIZE: tl.constexpr, FP8_MAX_
 def fp8_quantize_triton(x):
     x_shape_orig = x.shape
     x = x.view(-1, x_shape_orig[-1])
-    out_scaled = torch.empty(x_shape_orig, dtype=torch.float32, device=x.device)
+    quantized = torch.empty(x_shape_orig, dtype=torch.float8_e4m3fn, device=x.device)
     scales = torch.empty(x.shape[0], dtype=torch.bfloat16, device=x.device)
     BLOCK_SIZE = next_power_of_2(x_shape_orig[-1])
     grid = (x.shape[0],)
     FP8_MAX = 448.0
-    fp8_quantize_kernel[grid](x, out_scaled, scales, x_shape_orig[-1], BLOCK_SIZE, FP8_MAX_VAL=FP8_MAX, num_warps=8)
-    quantized = out_scaled.to(torch.float8_e4m3fn)
-    return quantized.view(x_shape_orig), scales.view(x_shape_orig[:-1])
+    fp8_quantize_kernel[grid](x, quantized, scales, x_shape_orig[-1], BLOCK_SIZE, FP8_MAX_VAL=FP8_MAX, num_warps=8)
+    return quantized, scales.view(x_shape_orig[:-1])
 
 
 def fp8_quantize_range_triton(x, qmax):
