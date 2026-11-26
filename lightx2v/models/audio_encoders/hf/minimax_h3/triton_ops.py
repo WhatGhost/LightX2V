@@ -3,7 +3,7 @@
 import torch
 import triton
 import triton.language as tl
-from triton.language.extra.cuda import libdevice
+from triton.language.extra import libdevice
 
 
 @triton.jit
@@ -21,7 +21,7 @@ def _upsample_snake_kernel(x, up_filter, alpha, beta, output, length, channels: 
     alpha_value = libdevice.exp(tl.load(alpha + row % channels))
     beta_value = libdevice.exp(tl.load(beta + row % channels))
     sine = libdevice.sin(alpha_value * value)
-    value += libdevice.rcp_rn(beta_value + 1.0e-9) * (sine * sine)
+    value += tl.math.div_rn(1.0, beta_value + 1.0e-9) * (sine * sine)
     tl.store(output + row * (2 * length) + t, value, mask=t < 2 * length)
 
 
